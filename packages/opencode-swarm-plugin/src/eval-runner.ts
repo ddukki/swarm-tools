@@ -153,10 +153,26 @@ export async function runEvals(
   } = options;
 
   try {
-    // Resolve to project root (evals are in evals/ relative to project root)
-    // If cwd is src/, go up one level
+    // Resolve to project root. Historically this package looked for evals/
+    // inside packages/opencode-swarm-plugin, but the repo moved eval files to
+    // the sibling packages/swarm-evals/src package. CI still runs this gate
+    // from packages/opencode-swarm-plugin, so discover both locations.
     const projectRoot = cwd.endsWith("src") ? path.dirname(cwd) : cwd;
-    const evalsDir = path.join(projectRoot, "evals");
+    const localEvalsDir = path.join(projectRoot, "evals");
+    const workspaceRoot = path.resolve(projectRoot, "../..");
+    const workspaceEvalsDir = path.join(workspaceRoot, "packages/swarm-evals/src");
+    let evaliteCwd = projectRoot;
+    const evalsDir = await fs
+      .access(localEvalsDir)
+      .then(() => localEvalsDir)
+      .catch(async () => {
+        await fs.access(workspaceEvalsDir);
+        // Evalite/Vitest only discovers files under its root. When using the
+        // workspace eval package, run from the monorepo root so the path filter
+        // is inside root instead of silently producing `Eval Files 0`.
+        evaliteCwd = workspaceRoot;
+        return workspaceEvalsDir;
+      });
     let evalPath: string | undefined;
 
     if (suiteFilter) {
@@ -206,7 +222,7 @@ export async function runEvals(
     
     await runEvalite({
       path: evalPath, // undefined = run all
-      cwd: projectRoot, // Use project root as working directory
+      cwd: evaliteCwd, // Use root that contains the selected eval path
       mode: "run-once-and-exit",
       scoreThreshold,
       outputPath,
@@ -240,26 +256,44 @@ export async function runEvals(
       });
     }
 
-    // Transform to structured result (evalite v1.0 API: output.evals with results)
-    const suites: SuiteResult[] = output.evals.map((evalItem: Evalite.Exported.Eval) => ({
-      name: evalItem.name,
-      filepath: evalItem.filepath,
-      status: evalItem.status,
-      duration: evalItem.duration,
-      averageScore: evalItem.averageScore,
-      evalCount: evalItem.results.length,
-      // Include evals if user wants detailed results
-      evals: evalItem.results.map((r: Evalite.Exported.Result) => ({
-        input: r.input,
-        output: r.output,
-        expected: r.expected,
-        scores: r.scores.map((s: Evalite.Exported.Score) => ({
-          name: s.name,
-          score: s.score,
-          description: s.description,
+    // Evalite changed its export shape between versions:
+    // - <=0.19: { evals: [{ results: [...] }] }
+    // - 1.0 beta: { suites: [{ evals: [...] }] }
+    // CI currently uses the 1.0 beta shape, so support both instead of
+    // silently reporting `Suites: 0 / Evals: 0` after a successful run.
+    const exportedSuites = Array.isArray((output as any).suites)
+      ? (output as any).suites
+      : Array.isArray((output as any).evals)
+        ? (output as any).evals
+        : [];
+
+    const suites: SuiteResult[] = exportedSuites.map((suiteItem: any) => {
+      const evalResults = Array.isArray(suiteItem.evals)
+        ? suiteItem.evals
+        : Array.isArray(suiteItem.results)
+          ? suiteItem.results
+          : [];
+
+      return {
+        name: suiteItem.name,
+        filepath: suiteItem.filepath,
+        status: suiteItem.status,
+        duration: suiteItem.duration,
+        averageScore: suiteItem.averageScore,
+        evalCount: evalResults.length,
+        // Include evals if user wants detailed results
+        evals: evalResults.map((r: any) => ({
+          input: r.input,
+          output: r.output,
+          expected: r.expected,
+          scores: (r.scores ?? []).map((s: Evalite.Exported.Score) => ({
+            name: s.name,
+            score: s.score,
+            description: s.description,
+          })),
         })),
-      })),
-    }));
+      };
+    });
 
     // Record eval runs to history
     for (const suite of suites) {
