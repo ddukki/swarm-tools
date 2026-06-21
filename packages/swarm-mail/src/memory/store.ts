@@ -333,9 +333,9 @@ export function createMemoryStore(db: SwarmDb) {
       }
 
       // FTS5 requires raw SQL - not yet in Drizzle's type-safe API
-      // Quote search query to escape FTS5 operators (hyphens, etc.)
-      // Without quotes, "unique-keyword-12345" → "unique" MINUS "keyword" → error
-      const quotedQuery = `"${searchQuery.replace(/"/g, '""')}"`;
+      // Use sql.raw() for the MATCH value since FTS5 does not support bound parameters
+      // Single-quote the value for SQL string literal (not double-quote which is an identifier)
+      const escapedQuery = searchQuery.replace(/'/g, "''");
 
       // Build filters
       const collectionFilter = collection ? sql`AND m.collection = ${collection}` : sql``;
@@ -365,7 +365,7 @@ export function createMemoryStore(db: SwarmDb) {
           fts.rank as score
         FROM memories_fts fts
         JOIN memories m ON m.rowid = fts.rowid
-        WHERE fts.content MATCH ${quotedQuery}
+        WHERE fts.content MATCH ${sql.raw("'" + escapedQuery + "'")}
           ${collectionFilter}
           ${decayFilter}
           ${statusFilter}
